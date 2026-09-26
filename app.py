@@ -1143,48 +1143,58 @@ def _plisio_key() -> str:
 
 def _plisio_request(method: str, path: str, payload=None) -> dict:
     """Talk to Plisio. Returns the response dict, or {"_error": ..., "_http": ...}
-    on failure — never raises, never logs the key. Plisio expects a
-    form-encoded body (not JSON); a JSON attempt is retried as form data."""
+    on failure — never raises, never logs the key. Plisio's param handling is
+    nonstandard, so POST tries, in order: query-string params (their native
+    style), form-encoded body, JSON body. First one the edge accepts wins."""
     key = _plisio_key()
     if not key:
         return {"_error": "no API key configured", "_http": 0}
     import urllib.parse as _up
-    _q = "?api_key=" + _up.quote(key, safe="")
-    _url = _PLISIO_API + path + _q
+    import json as _json
+    _flat = {k: v for k, v in payload.items() if v is not None} if isinstance(payload, dict) else {}
+    _qs = _up.urlencode(_flat)
     _encs = []
-    if method == "POST" and isinstance(payload, dict):
-        _encs = [("form", _up.urlencode({k: v for k, v in payload.items() if v is not None}).encode())]
-        import json as _json
-        _encs.append(("json", _json.dumps(payload).encode()))
+    if method == "POST" and _flat:
+        _encs = [
+            ("query", "?api_key=" + _up.quote(key, safe="") + "&" + _qs, None),
+            ("form", "?api_key=" + _up.quote(key, safe=""),
+             ("application/x-www-form-urlencoded", _qs.encode())),
+            ("json", "?api_key=" + _up.quote(key, safe=""),
+             ("application/json", _json.dumps(_flat).encode())),
+            ("getquery", "?api_key=" + _up.quote(key, safe="") + "&" + _qs, None),
+        ]
     else:
-        _encs = [("form", None)]
+        _encs = [("query", "?api_key=" + _up.quote(key, safe=""), None)]
     _last = None
-    for _ct, _data in _encs:
+    for _ct, _suffix, _b in _encs:
         try:
             import urllib.request as _ur
             import urllib.error as _ue
-            import json as _json
             _hdrs = {"Accept": "application/json",
                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                                    "Chrome/126.0.0.0 Safari/537.36"}
-            if _data is not None:
-                _hdrs["Content-Type"] = ("application/x-www-form-urlencoded" if _ct == "form"
-                                         else "application/json")
-            req = _ur.Request(_url, data=_data, method=method, headers=_hdrs)
+            _data = None
+            _meth = method
+            if _ct == "getquery":
+                _meth = "GET"
+            if _b is not None:
+                _hdrs["Content-Type"] = _b[0]
+                _data = _b[1]
+            req = _ur.Request(_PLISIO_API + path + _suffix, data=_data, method=_meth,
+                              headers=_hdrs)
             with _ur.urlopen(req, timeout=20) as r:
                 return _json.loads(r.read().decode("utf-8", "replace"))
         except _ue.HTTPError as e:
             _last = e
-            if _ct == "form" and e.code in (422, 400):
-                continue  # try the JSON encoding instead
+            if e.code in (422, 400, 404):
+                continue  # next encoding
             break
         except Exception as e:
             return {"_error": f"unreachable ({type(e).__name__})", "_http": 0}
-    # one last request failed with an HTTPError — decode it
+    # last attempt failed with an HTTPError — decode it
     if isinstance(_last, Exception) and hasattr(_last, "read"):
         try:
-            import json as _json
             _body = _json.loads(_last.read().decode("utf-8", "replace"))
             _d = _body.get("data") or {}
             _name = str(_d.get("name") or "") or str(_body.get("status") or "")
